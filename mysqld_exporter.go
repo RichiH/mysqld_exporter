@@ -42,6 +42,10 @@ var (
 		"collect.info_schema.tables.databases", "*",
 		"The list of databases to collect table stats for, or '*' for all",
 	)
+	innodbMetrics = flag.Bool(
+		"collect.info_schema.innodb_metrics", false,
+		"Collect metrics from information_schema.innodb_metrics",
+	)
 	collectGlobalStatus = flag.Bool(
 		"collect.global_status", true,
 		"Collect from SHOW GLOBAL STATUS",
@@ -145,6 +149,13 @@ const (
 		  FROM information_schema.tables t
 		  JOIN information_schema.columns c USING (table_schema,table_name)
 		  WHERE c.extra = 'auto_increment' AND t.auto_increment IS NOT NULL
+		`
+	infoSchemaInnodbMetricsQuery = `
+		SELECT
+		  name, subsystem, type, comment,
+		  count
+		  FROM information_schema.innodb_metrics
+		  WHERE status = 'enabled'
 		`
 	perfTableIOWaitsQuery = `
 		SELECT OBJECT_SCHEMA, OBJECT_NAME, COUNT_FETCH, COUNT_INSERT, COUNT_UPDATE, COUNT_DELETE,
@@ -783,6 +794,12 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	if *collectTableSchema {
 		if err = scrapeTableSchema(db, ch); err != nil {
 			log.Println("Error scraping table schema:", err)
+			return
+		}
+	}
+	if *innodbMetrics {
+		if err = scrapeInnodbMetrics(db, ch); err != nil {
+			log.Println("Error scraping information_schema.innodb_metrics:", err)
 			return
 		}
 	}
@@ -1726,6 +1743,40 @@ func scrapeTableSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
 		}
 	}
 
+	return nil
+}
+
+func scrapeInnodbMetrics(db *sql.DB, ch chan<- prometheus.Metric) error {
+	innodbMetricsRows, err := db.Query(infoSchemaInnodbMetricsQuery)
+	if err != nil {
+		return err
+	}
+	defer innodbMetricsRows.Close()
+
+	var (
+		name, subsystem, metricType, comment string
+		count                                uint64
+	)
+
+	for innodbMetricsRows.Next() {
+		if err := innodbMetricsRows.Scan(
+			&name, &subsystem, &metricType, &comment, &count,
+		); err != nil {
+			return err
+		}
+		metricName := "innodb_metrics_" + subsystem
+		metricHelp := "Innodb metrics subsystem " + subsystem
+		labels := prometheus.Labels{"name": name, "type": metricType, "comment": comment}
+		description := prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, informationSchema, metricName),
+			metricHelp, nil, labels,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			description,
+			prometheus.GaugeValue,
+			float64(count),
+		)
+	}
 	return nil
 }
 
